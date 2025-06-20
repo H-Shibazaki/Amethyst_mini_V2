@@ -1,4 +1,4 @@
-import pyhailort as hp
+import hailort as hp
 import numpy as np
 import cv2                       # 画像前処理で必要
 
