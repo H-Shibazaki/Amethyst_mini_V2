@@ -3,7 +3,7 @@
 import os
 import cv2
 from datetime import datetime
-from hailo_runner import runner, preprocess_rgb224  # 新モジュール
+from hailo_runner import HailoRunner, preprocess_rgb224  # 新モジュール
 
 # """【前処理】画像の左右25%ずつを黒く塗りつぶす"""
 # def mask_left_right(frame, mask_ratio=0.25):
@@ -15,6 +15,7 @@ from hailo_runner import runner, preprocess_rgb224  # 新モジュール
 
 """【前処理＋推論】NumPy & HailoRT 版"""
 def maeshori_and_predict(frame_bgr):
+    runner = HailoRunner(model_hef_path)
     tensor = preprocess_rgb224(frame_bgr)
     probs  = runner.infer(tensor)
     ng_prob, ok_prob = probs / probs.sum()
