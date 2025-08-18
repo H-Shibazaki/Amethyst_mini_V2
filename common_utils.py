@@ -1,16 +1,16 @@
 """汎用的に使う関数のまとめ"""
 
-import torch
-from torchvision import transforms
+# import torch
+# from torchvision import transforms   # ← PyTorch / TorchVision を使用しない構成に変更
 
-"""GPUを使って演算するように指定"""
-def get_device() -> str: 
+"""GPU を使って演算するように指定（Pi では CPU 固定）"""
+def get_device() -> str:
     return "cpu"
 
-"""ResNetモデルのフォーマットを最適化する"""
+"""画像前処理（旧 PyTorch transforms 互換ダミー）
+
+   * 現在の Raspberry Pi + HailoRT ビルドでは未使用。
+   * もし誤って呼ばれた場合は例外で知らせる。
+"""
 def get_data_transforms():
-    return transforms.Compose([
-        transforms.Resize((224, 224)),  # ResNetの入力サイズにリサイズ
-        transforms.ToTensor(),  # テンソルに変換
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # 正規化
-    ])
+    raise NotImplementedError("get_data_transforms() は HailoRT 版で使用しません。")

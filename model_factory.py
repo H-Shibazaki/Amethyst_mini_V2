@@ -15,4 +15,4 @@ def create_model():
     model = models.resnet34(weights=weights)  # 最新仕様で重みを指定
     num_features = model.fc.in_features  # 最終層の入力特徴量数を取得
     model.fc = nn.Linear(num_features, 2)  # 出力層を2クラス（NG, OK）に変更
-    return model
+    return model 

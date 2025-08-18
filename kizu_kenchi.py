@@ -1,155 +1,254 @@
-"""疵検知の全て"""
-
+"""疵検知: リアルタイム推論モジュール（mini版）"""
 import cv2
 import numpy as np
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
-
 from check_brightness import top_brightness, bottom_brightness
 from image_process import save_photo
-from common_utils import get_data_transforms    #HEFモデル内で必要なので残す
+# Hailo ランナーと前処理関数（crop 引数付き）をインポート
 from hailo_runner import HailoRunner, preprocess_rgb224
+import math
 
-runner_rasen    = HailoRunner("/home/pi/models/rasen.hef")
-runner_kurokawa = HailoRunner("/home/pi/models/kurokawa.hef")
+# -------------------- GStreamer パイプラインを動的生成 --------------------
+def build_pipeline(
+    width: int = 224,
+    height: int = 448,
+    cam_names = ("SENTECH-142124706912-24G6912", "SENTECH-142125602842-25F2842"),#1台目 / 2台目
+) -> str | None:
+    """
+    SENTECHカメラ2台のうち、接続されているものを優先順で自動選択し、
+    GStreamerパイプライン文字列を返す。
+    どちらもなければ None を返す。
+    """
+    try:
+        import gi
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+        Gst.init(None)
+        has_aravis = Gst.ElementFactory.find("aravissrc") is not None
+    except Exception:
+        has_aravis = False
 
+    if has_aravis:
+        for cam_name in cam_names:
+            pipeline = (
+                f"aravissrc camera-name={cam_name} ! "
+                "videoconvert ! videoscale ! "
+                f"video/x-raw,format=BGR,width={width},height={height} ! "
+                "appsink drop=true max-buffers=1"
+            )
+            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+            if cap.isOpened():
+                cap.release()
+                print(f"Aravisカメラ '{cam_name}' で接続しました")
+                return pipeline
+            cap.release()
+        print("SENTECHカメラ2台とも接続されていません。")
+        return None
+    else:
+        print("Aravisドライバが利用できません。")
+        return None
 
-def draw_text_with_japanese(image, text, position, font_path, font_size, color_result):
-    """Pillowを使用して日本語テキストを描画"""
-    # OpenCVの画像をPillow形式に変換
-    pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-    draw = ImageDraw.Draw(pil_image)
-    
-    # 日本語フォントを設定
+# -----------------------------------------------------------------------
+
+def draw_text_with_japanese(image, text, position, font_path, font_size, color):
+    """OpenCV画像上に日本語テキストを描画"""
+    pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil)
     font = ImageFont.truetype(font_path, font_size)
-    
-    # 日本語テキストを描画
-    draw.text(position, text, fill=color_result, font=font)
-    
-    # Pillow形式をOpenCV形式に戻す
-    return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+    draw.text(position, text, fill=color, font=font)
+    return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
 def create_gauge_bar(percent, length=20):
-    """パーセンテージに応じたゲージバー（文字列）を生成"""
-    filled_length = int(length * percent / 100)
-    bar = "|" * filled_length + "-" * (length - filled_length)
-    return f"[{bar}]\n0%        50%       100%"
+    """ビビリ率に応じたゲージバー文字列を生成"""
+    filled = int(length * percent / 100)
+    bar = "|" * filled + "-" * (length - filled)
+    return f"[{bar}]\n0%{' ' * (length//2 - 2)}50%{' ' * (length//2 - 3)}100%"
 
 def get_gauge_color(percent):
-    """ビビリ率に応じたゲージの色を返す"""
+    """ビビリ率に応じたバーの色を返す"""
     if percent <= 50:
-        return (0, 255, 0)  # 緑
+        return (0, 255, 0)
     elif percent <= 80:
-        return (255, 150, 0)  # オレンジ
+        return (255, 150, 0)
     else:
-        return (255, 0, 0)  # 赤
+        return (255, 0, 0)
 
-"""リアルタイムで推論処理を行い、結果をウィンドウに表示する"""
 def display_realtime_suiron_with_separate_windows(
-        model_save_path, auto_save=True, auto_save_threshold=(50, 100), 
-        cool_time_seconds=1, ng_rate_diff_threshold=5,
-        brightness_threshold=15, area_ratio=0.1 
-        ):
-    auto_save_threshold = auto_save_threshold  # 自動保存のNG率範囲（デフォルトは50%～100%）
+    model_rasen_path: str,
+    model_kurokawa_path: str,
+    *,
+    auto_save: bool,
+    auto_save_threshold: tuple[int, int],
+    cool_time_seconds: float,
+    ng_rate_diff_threshold: float,
+    brightness_threshold: int,
+    area_ratio: float,
+    use_ng_diff: bool
+):
+    import traceback
 
-    hef_model = HefModel(model_save_path)  # ← ここでHEFモデルを初期化
-    class_names = ['NG', 'OK']
+    runner_rasen = HailoRunner(model_rasen_path)
+    runner_kurokawa = HailoRunner(model_kurokawa_path)
 
-    cap = cv2.VideoCapture(0)
-    last_save_time = datetime.now()  # 最後に保存した時間を初期化
-    last_ng_rate = None  # 前回のNG率を初期化
+    # ここでパイプライン生成時にデバッグ表示
+    pipeline = build_pipeline(width=224, height=448)
+    print(f"【デバッグ】GStreamer pipeline: {pipeline}")
+    cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
     if not cap.isOpened():
-        print("カメラを開けませんでした")
+        print("【エラー】cap.isOpened() == False → カメラが開けません！")
         return
-    
-    result_img = np.zeros((200, 300, 3), dtype=np.uint8) 
 
-    # ウィンドウをリサイズ可能に設定
+    # ==== 変数の初期化 ====
+    last_save_time_rasen = datetime.now()
+    last_save_time_kurokawa = datetime.now()
+    last_ng_rate_rasen = None
+    last_ng_rate_kurokawa = None
+
     cv2.namedWindow("Preview", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Preview", 448, 448)  # ウィンドウの初期サイズを設定
+    cv2.resizeWindow("Preview", 448, 448)
+    cv2.namedWindow("Information", cv2.WINDOW_NORMAL)
+    font_path = "fonts/PixelMplus10-Regular.ttf"
+    font_size = 24
 
     while True:
-        ret, frame = cap.read()
-
-        if not ret:
-            print("フレームを取得できませんでした")
-            break
-
-        cv2.imshow("Preview", frame)  # プレビューウィンドウを表示
-
-        # 被写体の検知
-        if not top_brightness(frame, brightness_threshold, area_ratio):  #平均輝度が規定値以下の場合
-
-            #デバッグ用：print("top_brightness: no")
-            detection_text="材料: ナシ"
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+        try:
+            ret, frame = cap.read()
+            
+            ####print(f"【デバッグ】cap.read() ret: {ret}")
+            
+            if not ret:
+                print("【エラー】フレームが取得できません（cap.read()失敗）")
                 break
-            color_detection =  (0, 128, 0)  #暗い緑
 
-        elif not bottom_brightness(frame, brightness_threshold, area_ratio):
+            # フレームshape, dtype確認
+            ####print(f"【デバッグ】frame.shape: {getattr(frame, 'shape', None)}, dtype: {getattr(frame, 'dtype', None)}")
 
-            #デバッグ用：print("bottom_brightness: no")
-            detection_text="材料: ナシ"
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            # サイズ確認（想定外なら例外）
+            if not (isinstance(frame, np.ndarray) and frame.shape == (448, 224, 3)):
+                print(f"【エラー】フレームshapeが不正: {getattr(frame, 'shape', None)}（想定: (448, 224, 3)）")
                 break
-            color_detection =  (0, 128, 0)  #暗い緑
 
-        else:
-            detection_text="材料: アリ"
-            color_detection = (0, 255, 0) #緑
+            # テンソル生成（エラー箇所追跡）
+            tensor_top = preprocess_rgb224(frame, crop='top')
+            ####print(f"【デバッグ】tensor_top.shape: {tensor_top.shape}, nbytes: {tensor_top.nbytes}")
 
+            tensor_bot = preprocess_rgb224(frame, crop='bottom')
+            ####print(f"【デバッグ】tensor_bot.shape: {tensor_bot.shape}, nbytes: {tensor_bot.nbytes}")
 
-        # ★ HEFモデルによる推論部分
-        predicted_class, bibiri_value = hef_model.predict(frame)  # NG or OK, ビビリ率(%)
+            # 推論（try-exceptで例外追跡）
+            try:
+                probs_r = runner_rasen.infer(tensor_top)
+                ####print("【デバッグ】らせん推論raw出力:", probs_r)
+            except Exception as e:
+                print("【エラー】らせん推論で例外発生:")
+                traceback.print_exc()
+                break
 
-        result_text = f"判定: {predicted_class}, NG率: {bibiri_value}%"
-        result_img = np.zeros((150, 300, 3), dtype=np.uint8)
-        color_result = (0, 255, 0) if predicted_class == "OK" else (255, 0, 0)
+            try:
+                probs_k = runner_kurokawa.infer(tensor_bot)
+                ####print("【デバッグ】黒皮推論raw出力:", probs_k)
+            except Exception as e:
+                print("【エラー】黒皮推論で例外発生:")
+                traceback.print_exc()
+                break
 
-        # フォント設定
-        font_path = "fonts/PixelMplus10-Regular.ttf"  # 日本語対応フォントを指定
-        font_size = 24
+            # らせん疵モデル（上段）
+            if probs_r.sum() == 0:
+                print("【警告】らせん: probs_r.sum()==0 → ÷0対策ブランチに入ります（ng_r=0.0, ok_r=0.0）")
+                ng_r, ok_r = 0.0, 0.0
+            else:
+                ng_r, ok_r = probs_r / probs_r.sum()
+                
+            pred_r = "NG" if ng_r > ok_r else "OK"
+            val_r = int(ng_r * 100) if not math.isnan(ng_r) else 0
 
-        # Informationウィンドウの描画部分修正
-        result_img = draw_text_with_japanese(result_img, result_text, (10, 10), font_path, font_size, color_result)
+            # 黒皮残りモデル（下段）
+            if probs_k.sum() == 0:
+                print("【警告】黒皮: probs_k.sum()==0 → ÷0対策ブランチに入ります（ng_k=0.0, ok_k=0.0）")
+                ng_k, ok_k = 0.0, 0.0  # または適切な初期値
+            else:
+                ng_k, ok_k = probs_k / probs_k.sum()
 
-        gauge_text = create_gauge_bar(bibiri_value)
-        gauge_color = get_gauge_color(bibiri_value)
-        result_img = draw_text_with_japanese(result_img, gauge_text, (10, 45), font_path, 24, gauge_color)
-        result_img = draw_text_with_japanese(result_img, detection_text, (10, 110), font_path, font_size, color_detection)
+            pred_k = "NG" if ng_k > ok_k else "OK"
+            val_k = int(ng_k * 100) if not math.isnan(ng_k) else 0
 
-        cv2.imshow("Information", result_img)
+            # -------- 描 画 --------
+            result_text = f"【らせん】{pred_r} {val_r}%  【黒皮】{pred_k} {val_k}%"
+            result_img = np.zeros((180, 600, 3), dtype=np.uint8)
 
-        key = cv2.waitKey(1) & 0xFF
+            # メインテキスト
+            result_img = draw_text_with_japanese(
+                result_img, result_text, (10, 10),
+                font_path, font_size, (255, 255, 255)
+            )
+            # ゲージ：らせん
+            result_img = draw_text_with_japanese(
+                result_img, create_gauge_bar(val_r, length=20),
+                (10, 50), font_path, font_size, get_gauge_color(val_r)
+            )
+            # ゲージ：黒皮
+            result_img = draw_text_with_japanese(
+                result_img, create_gauge_bar(val_k, length=20),
+                (320, 50), font_path, font_size, get_gauge_color(val_k)
+            )
+            # 検出マテリアル
+            if not top_brightness(frame, brightness_threshold, area_ratio) or \
+               not bottom_brightness(frame, brightness_threshold, area_ratio):
+                detection_text = "材料: ナシ"
+                color_det = (0, 128, 0)
+            else:
+                detection_text = "材料: アリ"
+                color_det = (0, 255, 0)
+            result_img = draw_text_with_japanese(
+                result_img, detection_text, (10, 130),
+                font_path, font_size, color_det
+            )
+            cv2.imshow("Preview", frame)
+            cv2.imshow("Information", result_img)
 
-        if key == ord('s'):
-            frame_copy = frame.copy()
-            save_photo(frame_copy, predicted_class, bibiri_value, "images/Photo/manual")
+            key = cv2.waitKey(1) & 0xFF
 
-        # 自動保存機能（auto_saveのチェックボックスがTrue、かつ、材料を検知したときのみ自動保存を実行）
-        if auto_save and detection_text == "材料: アリ" and auto_save_threshold[0] <= bibiri_value <= auto_save_threshold[1]:
-            current_time = datetime.now()
-            elapsed_time = (current_time - last_save_time).total_seconds()
-            ng_rate_diff = abs(bibiri_value - last_ng_rate) if last_ng_rate is not None else float('inf')
+            # --- 手動保存 ---
+            if key == ord('s'):
+                save_photo(frame[:224, :], f"rasen_{pred_r}", f"{val_r}", "images/rasen/Photo/manual")
+                print(f"[manual] らせん疵: {pred_r} ({val_r}%) を images/rasen/Photo/manual に保存しました。")
+            elif key == ord('d'):
+                save_photo(frame[224:, :], f"kurokawa_{pred_k}", f"{val_k}", "images/kurokawa/Photo/manual")
+                print(f"[manual] 黒皮残り: {pred_k} ({val_k}%) を images/kurokawa/Photo/manual に保存しました。")
 
-            # クールタイムとNG率差分条件を確認
-            if elapsed_time < cool_time_seconds:
-                print(f"クールタイム未達: elapsed_time={elapsed_time:.2f}s < {cool_time_seconds:.2f}s")
-                continue  # クールタイム未達の場合、次のフレームへ
+            # --- 自動保存 ---
+            now = datetime.now()
+            # らせん疵（上半分）自動保存
+            if (auto_save and detection_text == "材料: アリ"
+                and auto_save_threshold[0] <= val_r <= auto_save_threshold[1]):
+                elapsed_rasen = (now - last_save_time_rasen).total_seconds()
+                ng_diff_rasen = abs(val_r - last_ng_rate_rasen) if last_ng_rate_rasen is not None else float('inf')
+                if elapsed_rasen >= cool_time_seconds and (not use_ng_diff or ng_diff_rasen > ng_rate_diff_threshold):
+                    save_photo(frame[:224, :], f"rasen_{pred_r}", f"{val_r}", "images/rasen/Photo/auto")
+                    print(f"[auto] らせん疵: {pred_r} ({val_r}%) を images/rasen/Photo/auto に保存しました。")
+                    last_save_time_rasen = now
+                    last_ng_rate_rasen = val_r
 
-            if ng_rate_diff <= ng_rate_diff_threshold:
-                print(f"NG率差分未達: ng_rate_diff={ng_rate_diff:.2f} <= {ng_rate_diff_threshold:.2f}")
-                continue  # NG率差分未達の場合、次のフレームへ
+            # 黒皮残り（下半分）自動保存
+            if (auto_save and detection_text == "材料: アリ"
+                and auto_save_threshold[0] <= val_k <= auto_save_threshold[1]):
+                elapsed_kurokawa = (now - last_save_time_kurokawa).total_seconds()
+                ng_diff_kurokawa = abs(val_k - last_ng_rate_kurokawa) if last_ng_rate_kurokawa is not None else float('inf')
+                if elapsed_kurokawa >= cool_time_seconds and (not use_ng_diff or ng_diff_kurokawa > ng_rate_diff_threshold):
+                    save_photo(frame[224:, :], f"kurokawa_{pred_k}", f"{val_k}", "images/kurokawa/Photo/auto")
+                    print(f"[auto] 黒皮残り: {pred_k} ({val_k}%) を images/kurokawa/Photo/auto に保存しました。")
+                    last_save_time_kurokawa = now
+                    last_ng_rate_kurokawa = val_k
 
-            # 保存処理
-            save_photo(frame.copy(), predicted_class, bibiri_value, "images/photo/auto")
-            last_save_time = current_time
-            last_ng_rate = bibiri_value
+            if key == ord('q'):
+                break
 
-        if key == ord('q'):
+        except Exception as e:
+            print("【致命的エラー】ループ内で例外発生:")
+            import traceback
+            traceback.print_exc()
             break
 
     cap.release()
     cv2.destroyAllWindows()
-
-
