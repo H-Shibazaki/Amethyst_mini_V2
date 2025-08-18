@@ -1,3 +1,68 @@
 *.bmp
 *.ttf
 *.pth
+# =========================
+# Python 共通
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+.env.*
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.cache/
+tmp/
+logs/
+*.log
+
+# =========================
+# パッケージ/ビルド成果物
+# =========================
+build/
+dist/
+.eggs/
+*.egg-info/
+wheels/
+pip-wheel-metadata/
+
+# =========================
+# OS / IDE
+# =========================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# =========================
+# モデル/重いバイナリ
+# （Git LFS を使う場合は .gitattributes で管理に切替）
+# =========================
+models/**/*.hef
+models/**/*.onnx
+models/**/*.pth
+models/**/*.pt
+
+# =========================
+# 取得画像・生成物
+# （運用上は保存先を丸ごと除外）
+# =========================
+images/**/Photo/**
+images/**/*.bmp
+videos/
+recordings/
+captures/
+
+# 空ディレクトリ維持用
+!images/.gitkeep
+!videos/.gitkeep
+
+# =========================
+# その他（必要なら）
+# =========================
+# *.csv        # ログをCSVで吐くなら有効化
+# data/        # 学習データを置くなら除外
