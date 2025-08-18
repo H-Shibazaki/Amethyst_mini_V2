@@ -97,9 +97,9 @@ class App:
         toggle_diff()
         # 輝度閾値／参照エリア比率
         ttk.Label(self.main_frame, text="輝度閾値:").pack(anchor=tk.W, padx=10, pady=5)
-        bright = ttk.Entry(self.main_frame, width=6); bright.pack(anchor=tk.W, padx=10); bright.insert(0,"20")
+        bright = ttk.Entry(self.main_frame, width=6); bright.pack(anchor=tk.W, padx=10); bright.insert(0,"10")
         ttk.Label(self.main_frame, text="参照エリア比率:").pack(anchor=tk.W, padx=10, pady=5)
-        area = ttk.Entry(self.main_frame, width=6); area.pack(anchor=tk.W, padx=10); area.insert(0,"0.1")
+        area = ttk.Entry(self.main_frame, width=6); area.pack(anchor=tk.W, padx=10); area.insert(0,"0.5")
         # Start ボタン
         btn = tk.Button(
             self.main_frame,
