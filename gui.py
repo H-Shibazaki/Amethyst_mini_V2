@@ -5,10 +5,14 @@ import tkinter as tk
 from tkinter import ttk, filedialog
 # from model_factory import train_model   # 学習機能は mini 版では不要のためコメントアウト
 from kizu_kenchi import display_realtime_suiron_with_separate_windows
+
+from version_info import get_window_title   #バージョン管理用
+
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Amethyst_mini リアルタイム疵検知")
+        #self.root.title("Amethyst_mini リアルタイム疵検知")←version_infoでタイトルを管理するようにしたので不要になった
+        self.root.title(get_window_title()) 
         self.root.geometry("600x600")
         self.setup_sidebar()
         self.setup_main_frame()
