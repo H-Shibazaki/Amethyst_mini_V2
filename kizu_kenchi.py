@@ -1,19 +1,29 @@
 """疵検知: リアルタイム推論モジュール（mini版）"""
+
 import cv2
 import numpy as np
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 from check_brightness import top_brightness, bottom_brightness
 from image_process import save_photo
+
+# 推論前の画像処理を追加
+from preprocess import enhance_defect  # 学習時と同じ前処理（horizontal / blackhat）
+
+
 # Hailo ランナーと前処理関数（crop 引数付き）をインポート
 from hailo_runner import HailoRunner, preprocess_rgb224
 import math
+
 
 # -------------------- GStreamer パイプラインを動的生成 --------------------
 def build_pipeline(
     width: int = 224,
     height: int = 448,
-    cam_names = ("SENTECH-142124706912-24G6912", "SENTECH-142125602842-25F2842"),#1台目 / 2台目
+    cam_names=(
+        "SENTECH-142124706912-24G6912",
+        "SENTECH-142125602842-25F2842",
+    ),  # 1台目 / 2台目
 ) -> str | None:
     """
     SENTECHカメラ2台のうち、接続されているものを優先順で自動選択し、
@@ -22,8 +32,10 @@ def build_pipeline(
     """
     try:
         import gi
+
         gi.require_version("Gst", "1.0")
         from gi.repository import Gst
+
         Gst.init(None)
         has_aravis = Gst.ElementFactory.find("aravissrc") is not None
     except Exception:
@@ -49,7 +61,9 @@ def build_pipeline(
         print("Aravisドライバが利用できません。")
         return None
 
+
 # -----------------------------------------------------------------------
+
 
 def draw_text_with_japanese(image, text, position, font_path, font_size, color):
     """OpenCV画像上に日本語テキストを描画"""
@@ -59,11 +73,13 @@ def draw_text_with_japanese(image, text, position, font_path, font_size, color):
     draw.text(position, text, fill=color, font=font)
     return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
+
 def create_gauge_bar(percent, length=20):
     """ビビリ率に応じたゲージバー文字列を生成"""
     filled = int(length * percent / 100)
     bar = "|" * filled + "-" * (length - filled)
     return f"[{bar}]\n0%{' ' * (length//2 - 2)}50%{' ' * (length//2 - 3)}100%"
+
 
 def get_gauge_color(percent):
     """ビビリ率に応じたバーの色を返す"""
@@ -73,6 +89,35 @@ def get_gauge_color(percent):
         return (255, 150, 0)
     else:
         return (255, 0, 0)
+
+
+# ------------------------------------------------------------
+# 学習時と同じ流れで「上半分=横線強調」「下半分=ブラックハット」を適用し、
+# 224x224 の RGB(uint8) フラット配列にして返す。保存は生フレームのまま。
+# ------------------------------------------------------------
+def _apply_training_preprocess_to_halves(frame_bgr):
+    # frame_bgr: (448, 224, 3) BGR
+    h, w = frame_bgr.shape[:2]
+    mid = h // 2
+
+    # 上半分: 横線強調（らせん疵）
+    top_bgr = frame_bgr[0:mid, :, :].copy()
+    top_pil = Image.fromarray(cv2.cvtColor(top_bgr, cv2.COLOR_BGR2RGB))
+    top_pil_enh = enhance_defect(
+        top_pil, method="horizontal"
+    )  # rotate等はpreprocess.pyの既定
+    top_rgb = np.array(top_pil_enh).astype(np.uint8)  # (224,224,3) RGB
+    top_flat = top_rgb.ravel()
+
+    # 下半分: ブラックハット（黒皮残り）
+    bot_bgr = frame_bgr[mid:h, :, :].copy()
+    bot_pil = Image.fromarray(cv2.cvtColor(bot_bgr, cv2.COLOR_BGR2RGB))
+    bot_pil_enh = enhance_defect(bot_pil, method="blackhat")  # to_rgb3=True既定
+    bot_rgb = np.array(bot_pil_enh).astype(np.uint8)  # (224,224,3) RGB
+    bot_flat = bot_rgb.ravel()
+
+    return top_flat, bot_flat
+
 
 def display_realtime_suiron_with_separate_windows(
     model_rasen_path: str,
@@ -84,7 +129,7 @@ def display_realtime_suiron_with_separate_windows(
     ng_rate_diff_threshold: float,
     brightness_threshold: int,
     area_ratio: float,
-    use_ng_diff: bool
+    use_ng_diff: bool,
 ):
     import traceback
 
@@ -105,18 +150,24 @@ def display_realtime_suiron_with_separate_windows(
     last_ng_rate_rasen = None
     last_ng_rate_kurokawa = None
 
+    # ウィンドウの名称とサイズを定義
     cv2.namedWindow("Preview", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Preview", 448, 448)
+    cv2.resizeWindow("Preview", 448, 896)
     cv2.namedWindow("Information", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Information", 600, 180)
+
     font_path = "fonts/PixelMplus10-Regular.ttf"
     font_size = 24
+
+    # --- 位置適用フラグ（コメントは残す） ---
+    applied_pos = False
 
     while True:
         try:
             ret, frame = cap.read()
-            
+
             ####print(f"【デバッグ】cap.read() ret: {ret}")
-            
+
             if not ret:
                 print("【エラー】フレームが取得できません（cap.read()失敗）")
                 break
@@ -126,15 +177,19 @@ def display_realtime_suiron_with_separate_windows(
 
             # サイズ確認（想定外なら例外）
             if not (isinstance(frame, np.ndarray) and frame.shape == (448, 224, 3)):
-                print(f"【エラー】フレームshapeが不正: {getattr(frame, 'shape', None)}（想定: (448, 224, 3)）")
+                print(
+                    f"【エラー】フレームshapeが不正: {getattr(frame, 'shape', None)}（想定: (448, 224, 3)）"
+                )
                 break
 
             # テンソル生成（エラー箇所追跡）
-            tensor_top = preprocess_rgb224(frame, crop='top')
+            # tensor_top = preprocess_rgb224(frame, crop="top")
             ####print(f"【デバッグ】tensor_top.shape: {tensor_top.shape}, nbytes: {tensor_top.nbytes}")
 
-            tensor_bot = preprocess_rgb224(frame, crop='bottom')
+            # tensor_bot = preprocess_rgb224(frame, crop="bottom")
             ####print(f"【デバッグ】tensor_bot.shape: {tensor_bot.shape}, nbytes: {tensor_bot.nbytes}")
+
+            tensor_top, tensor_bot = _apply_training_preprocess_to_halves(frame)
 
             # 推論（try-exceptで例外追跡）
             try:
@@ -155,17 +210,21 @@ def display_realtime_suiron_with_separate_windows(
 
             # らせん疵モデル（上段）
             if probs_r.sum() == 0:
-                print("【警告】らせん: probs_r.sum()==0 → ÷0対策ブランチに入ります（ng_r=0.0, ok_r=0.0）")
+                print(
+                    "【警告】らせん: probs_r.sum()==0 → ÷0対策ブランチに入ります（ng_r=0.0, ok_r=0.0）"
+                )
                 ng_r, ok_r = 0.0, 0.0
             else:
                 ng_r, ok_r = probs_r / probs_r.sum()
-                
+
             pred_r = "NG" if ng_r > ok_r else "OK"
             val_r = int(ng_r * 100) if not math.isnan(ng_r) else 0
 
             # 黒皮残りモデル（下段）
             if probs_k.sum() == 0:
-                print("【警告】黒皮: probs_k.sum()==0 → ÷0対策ブランチに入ります（ng_k=0.0, ok_k=0.0）")
+                print(
+                    "【警告】黒皮: probs_k.sum()==0 → ÷0対策ブランチに入ります（ng_k=0.0, ok_k=0.0）"
+                )
                 ng_k, ok_k = 0.0, 0.0  # または適切な初期値
             else:
                 ng_k, ok_k = probs_k / probs_k.sum()
@@ -179,74 +238,141 @@ def display_realtime_suiron_with_separate_windows(
 
             # メインテキスト
             result_img = draw_text_with_japanese(
-                result_img, result_text, (10, 10),
-                font_path, font_size, (255, 255, 255)
+                result_img, result_text, (10, 10), font_path, font_size, (255, 255, 255)
             )
             # ゲージ：らせん
             result_img = draw_text_with_japanese(
-                result_img, create_gauge_bar(val_r, length=20),
-                (10, 50), font_path, font_size, get_gauge_color(val_r)
+                result_img,
+                create_gauge_bar(val_r, length=20),
+                (10, 50),
+                font_path,
+                font_size,
+                get_gauge_color(val_r),
             )
             # ゲージ：黒皮
             result_img = draw_text_with_japanese(
-                result_img, create_gauge_bar(val_k, length=20),
-                (320, 50), font_path, font_size, get_gauge_color(val_k)
+                result_img,
+                create_gauge_bar(val_k, length=20),
+                (320, 50),
+                font_path,
+                font_size,
+                get_gauge_color(val_k),
             )
             # 検出マテリアル
-            if not top_brightness(frame, brightness_threshold, area_ratio) or \
-               not bottom_brightness(frame, brightness_threshold, area_ratio):
+            if not top_brightness(
+                frame, brightness_threshold, area_ratio
+            ) or not bottom_brightness(frame, brightness_threshold, area_ratio):
                 detection_text = "材料: ナシ"
                 color_det = (0, 128, 0)
             else:
                 detection_text = "材料: アリ"
                 color_det = (0, 255, 0)
             result_img = draw_text_with_japanese(
-                result_img, detection_text, (10, 130),
-                font_path, font_size, color_det
+                result_img, detection_text, (10, 130), font_path, font_size, color_det
             )
-            cv2.imshow("Preview", frame)
+            display_frame = cv2.resize(
+                frame, (448, 896), interpolation=cv2.INTER_NEAREST
+            )
+            cv2.imshow("Preview", display_frame)
             cv2.imshow("Information", result_img)
+
+            # --- 起動直後に一度だけ配置を適用（削除禁止のコメント保持）---
+            if not applied_pos:
+                PREVIEW_POS = (50, 50)  # 左上にプレビュー
+                INFO_POS = (520, 50)  # 右隣にインフォ
+                cv2.moveWindow("Preview", *PREVIEW_POS)
+                cv2.resizeWindow("Information", 600, 180)
+                cv2.moveWindow("Information", *INFO_POS)
+                cv2.waitKey(1)  # WMに位置変更を反映させる
+                applied_pos = True
 
             key = cv2.waitKey(1) & 0xFF
 
             # --- 手動保存 ---
-            if key == ord('s'):
-                save_photo(frame[:224, :], f"rasen_{pred_r}", f"{val_r}", "images/rasen/Photo/manual")
-                print(f"[manual] らせん疵: {pred_r} ({val_r}%) を images/rasen/Photo/manual に保存しました。")
-            elif key == ord('d'):
-                save_photo(frame[224:, :], f"kurokawa_{pred_k}", f"{val_k}", "images/kurokawa/Photo/manual")
-                print(f"[manual] 黒皮残り: {pred_k} ({val_k}%) を images/kurokawa/Photo/manual に保存しました。")
+            if key == ord("s"):
+                save_photo(
+                    frame[:224, :],
+                    f"rasen_{pred_r}",
+                    f"{val_r}",
+                    "images/rasen/Photo/manual",
+                )
+                print(
+                    f"[manual] らせん疵: {pred_r} ({val_r}%) を images/rasen/Photo/manual に保存しました。"
+                )
+            elif key == ord("d"):
+                save_photo(
+                    frame[224:, :],
+                    f"kurokawa_{pred_k}",
+                    f"{val_k}",
+                    "images/kurokawa/Photo/manual",
+                )
+                print(
+                    f"[manual] 黒皮残り: {pred_k} ({val_k}%) を images/kurokawa/Photo/manual に保存しました。"
+                )
 
             # --- 自動保存 ---
             now = datetime.now()
             # らせん疵（上半分）自動保存
-            if (auto_save and detection_text == "材料: アリ"
-                and auto_save_threshold[0] <= val_r <= auto_save_threshold[1]):
+            if (
+                auto_save
+                and detection_text == "材料: アリ"
+                and auto_save_threshold[0] <= val_r <= auto_save_threshold[1]
+            ):
                 elapsed_rasen = (now - last_save_time_rasen).total_seconds()
-                ng_diff_rasen = abs(val_r - last_ng_rate_rasen) if last_ng_rate_rasen is not None else float('inf')
-                if elapsed_rasen >= cool_time_seconds and (not use_ng_diff or ng_diff_rasen > ng_rate_diff_threshold):
-                    save_photo(frame[:224, :], f"rasen_{pred_r}", f"{val_r}", "images/rasen/Photo/auto")
-                    print(f"[auto] らせん疵: {pred_r} ({val_r}%) を images/rasen/Photo/auto に保存しました。")
+                ng_diff_rasen = (
+                    abs(val_r - last_ng_rate_rasen)
+                    if last_ng_rate_rasen is not None
+                    else float("inf")
+                )
+                if elapsed_rasen >= cool_time_seconds and (
+                    not use_ng_diff or ng_diff_rasen > ng_rate_diff_threshold
+                ):
+                    save_photo(
+                        frame[:224, :],
+                        f"rasen_{pred_r}",
+                        f"{val_r}",
+                        "images/rasen/Photo/auto",
+                    )
+                    print(
+                        f"[auto] らせん疵: {pred_r} ({val_r}%) を images/rasen/Photo/auto に保存しました。"
+                    )
                     last_save_time_rasen = now
                     last_ng_rate_rasen = val_r
 
             # 黒皮残り（下半分）自動保存
-            if (auto_save and detection_text == "材料: アリ"
-                and auto_save_threshold[0] <= val_k <= auto_save_threshold[1]):
+            if (
+                auto_save
+                and detection_text == "材料: アリ"
+                and auto_save_threshold[0] <= val_k <= auto_save_threshold[1]
+            ):
                 elapsed_kurokawa = (now - last_save_time_kurokawa).total_seconds()
-                ng_diff_kurokawa = abs(val_k - last_ng_rate_kurokawa) if last_ng_rate_kurokawa is not None else float('inf')
-                if elapsed_kurokawa >= cool_time_seconds and (not use_ng_diff or ng_diff_kurokawa > ng_rate_diff_threshold):
-                    save_photo(frame[224:, :], f"kurokawa_{pred_k}", f"{val_k}", "images/kurokawa/Photo/auto")
-                    print(f"[auto] 黒皮残り: {pred_k} ({val_k}%) を images/kurokawa/Photo/auto に保存しました。")
+                ng_diff_kurokawa = (
+                    abs(val_k - last_ng_rate_kurokawa)
+                    if last_ng_rate_kurokawa is not None
+                    else float("inf")
+                )
+                if elapsed_kurokawa >= cool_time_seconds and (
+                    not use_ng_diff or ng_diff_kurokawa > ng_rate_diff_threshold
+                ):
+                    save_photo(
+                        frame[224:, :],
+                        f"kurokawa_{pred_k}",
+                        f"{val_k}",
+                        "images/kurokawa/Photo/auto",
+                    )
+                    print(
+                        f"[auto] 黒皮残り: {pred_k} ({val_k}%) を images/kurokawa/Photo/auto に保存しました。"
+                    )
                     last_save_time_kurokawa = now
                     last_ng_rate_kurokawa = val_k
 
-            if key == ord('q'):
+            if key == ord("q"):
                 break
 
         except Exception as e:
             print("【致命的エラー】ループ内で例外発生:")
             import traceback
+
             traceback.print_exc()
             break
 

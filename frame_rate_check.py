@@ -2,6 +2,7 @@ import time
 import cv2
 import numpy as np
 from hailo_runner import HailoRunner, preprocess_rgb224
+from thermal_monitor import get_cpu_temp_c, get_hailo_temp_c
 
 
 def build_pipeline(width: int = 224, height: int = 448, cam_id: str = None) -> str:
@@ -51,6 +52,10 @@ if not cap.isOpened():
     print("カメラを開けませんでした")
     exit()
 
+# 温度表示用のキャッシュと更新タイマー
+last_temp_update = 0
+cpu_temp, hailo_temp = 0.0, 0.0
+
 while True:
     loop_start = time.time()
     print("\n---- 新フレーム ----")
@@ -98,7 +103,7 @@ while True:
         ng_r, ok_r = 0.0, 0.0
     else:
         ng_r, ok_r = probs_rasen / probs_rasen.sum()
-        
+
     predicted_class_rasen = "NG" if ng_r > ok_r else "OK"
     rasen_value = int(ng_r * 100)
 
@@ -121,6 +126,34 @@ while True:
 
     loop_end = time.time()
     fps = 1 / (loop_end - loop_start) if (loop_end - loop_start) > 0 else 0
+
+    # === 温度更新（2秒ごと） ===
+    now = time.time()
+    if now - last_temp_update >= 2.0:
+        cpu_temp = get_cpu_temp_c()
+        hailo_temp = get_hailo_temp_c()
+        last_temp_update = now
+
+    # === フレームにオーバレイ描画（2行表示） ===
+    cv2.putText(
+        frame,
+        f"CPU: {cpu_temp:.1f}C",
+        (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 255),
+        2,
+    )
+
+    cv2.putText(
+        frame,
+        f"Hailo: {hailo_temp:.1f}C",
+        (10, 60),  # Y座標をずらして2行目に
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 255),
+        2,
+    )
 
     print(f"[{time.strftime('%H:%M:%S', time.localtime(loop_end))}] ループ終了")
     print(f"合計ループ時間: {loop_end - loop_start:.4f} 秒 (FPS: {fps:.2f})")
